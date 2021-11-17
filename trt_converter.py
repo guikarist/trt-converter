@@ -1,6 +1,12 @@
+import os
 from typing import Dict, List, Tuple
 
 import numpy as np
+import onnx
+import onnxoptimizer
+import onnxsim
+from onnx.checker import check_model
+from onnx.onnx_ml_pb2 import _TENSORPROTO_DATATYPE
 from polygraphy import util
 from polygraphy.backend.trt import (
     CreateConfig,
@@ -12,7 +18,7 @@ from polygraphy.backend.trt import (
 )
 from polygraphy.logger import G_LOGGER
 
-G_LOGGER.severity = G_LOGGER.ULTRA_VERBOSE
+G_LOGGER.severity = G_LOGGER.INFO
 
 MODEL_NAME = 'tcn-with-two-inputs'
 BATCH_SIZE = 4500
@@ -40,9 +46,11 @@ class TRTConverter:
             restricted=None,
             use_dla=None,
             allow_gpu_fallback=None,
+            use_onnx_optimizer=True,
+            use_onnx_simplifier=True,
             min_batch_size=1,
-            opt_batch_size=1,
             max_batch_size=1,
+            opt_batch_size=1,
             calibration_data_generator=None,
             calibration_cache=None,
     ):
@@ -92,14 +100,10 @@ class TRTConverter:
                     run on DLA.
                     Has no effect if DLA is not enabled.
                     Defaults to False.
-            calibration_data_generator (generator):
-                    A generator to provide data for int8 calibration. The data should be in the following format:
-                        {'input_name_1': np.ndarray(), 'input_name_2': np.ndarray()}
-                    '_random_data_generator' should be a good sample to start writing your own data generator.
-                    If unspecified in the int8 mode, random data will be generated for calibration.
-            calibration_cache (Union[str, file-like]):
-                    A path or file-like object where we load/save the int8 calibration cache to speed up the
-                    building process.
+            use_onnx_optimizer (bool):
+                    Whether to use ONNX Optimizer. For more details: https://github.com/onnx/optimizer
+            use_onnx_simplifier (bool):
+                    Whether to use ONNX Simplifier. For more details: https://github.com/daquexian/onnx-simplifier
             min_batch_size (int):
                     The minimal batch size to be used in model inferences. Only works for models whose inputs have
                     dynamic shapes.
@@ -109,6 +113,14 @@ class TRTConverter:
             opt_batch_size (int):
                     The batch size to be mainly used and optimized in model inferences. Only works for models whose
                     inputs have dynamic shapes.
+            calibration_data_generator (generator):
+                    A generator to provide data for int8 calibration. The data should be in the following format:
+                        {'input_name_1': np.ndarray(), 'input_name_2': np.ndarray()}
+                    '_random_data_generator' should be a good sample to start writing your own data generator.
+                    If unspecified in the int8 mode, random data will be generated for calibration.
+            calibration_cache (Union[str, file-like]):
+                    A path or file-like object where we load/save the int8 calibration cache to speed up the
+                    building process.
         """
         self.max_workspace_size = util.default(max_workspace_size, 1 << 24)
         self.tf32 = util.default(tf32, False)
@@ -122,6 +134,8 @@ class TRTConverter:
         self.use_dla = util.default(use_dla, False)
         self.allow_gpu_fallback = util.default(allow_gpu_fallback, False)
 
+        self.use_onnx_optimizer_ = use_onnx_optimizer
+        self.use_onnx_simplifier_ = use_onnx_simplifier
         self.min_batch_size_ = min_batch_size
         self.max_batch_size_ = max_batch_size
         self.opt_batch_size_ = opt_batch_size
@@ -130,70 +144,110 @@ class TRTConverter:
         self.calibration_data_generator_ = calibration_data_generator
         self.calibration_cache_ = calibration_cache
 
-        self.inputs_: Dict[str, Tuple[List[int], str]] = {}  # {'input_name': ([dim0, dim1, ...], 'dtype')}
+        # {'input_name': ([dim0, dim1, ...], 'dtype', is_dynamic_batch_size)}
+        self.inputs_: Dict[str, Tuple[List[int], str, bool]] = {}
 
-    def run(self, onnx_model, output_engine='out.trt'):
+    def run(self, onnx_model_path, output_engine='out.trt', optimized_model_path='optimized.onnx',
+            remove_optimized_model=False):
         """
         Convert an ONNX model to a TensorRT engine.
 
         Args:
-            onnx_model (Union[str, file-like]):
+            onnx_model_path (Union[str, file-like]):
                     The ONNX model to be converted
             output_engine (Union[str, file-like]):
                     The converted TensorRT engine
+            optimized_model_path (Union[str, file-like]):
+                    The name of temporary optimized model
+            remove_optimized_model (bool):
+                    Whether to remove the temporary optimized model
         """
-        network = network_from_onnx_path(onnx_model)
+        model = onnx.load(onnx_model_path)
+        self._set_inputs(model)
 
-        profile = self._set_optimization_profiles(network[1])
-        if self.int8:
-            if self.calibration_data_generator_ is None:
-                self.calibration_data_generator_ = Calibrator(data_loader=self._random_data_generator(),
-                                                              cache=self.calibration_cache_)
-        config = CreateConfig(profiles=profile,
-                              calibrator=self.calibration_data_generator_,
-                              **self._get_tensorrt_config())
+        # Optimize ONNX model
+        if self.use_onnx_optimizer_ or self.use_onnx_simplifier_:
+            onnx.checker.check_model(model)
 
+            if self.use_onnx_optimizer_:
+                model = self._run_onnx_optimizer(model)
+            if self.use_onnx_simplifier_:
+                if any(x[2] for x in self.inputs_.values()):
+                    # There are dynamic input shapes
+                    model = self._run_onnx_simplifier(model, dynamic_input_shape=True,
+                                                      input_shapes=self._get_fixed_input_shapes())
+                else:
+                    model = self._run_onnx_simplifier(model)
+            onnx.save(model, optimized_model_path)
+
+            network = network_from_onnx_path(optimized_model_path)
+
+            if remove_optimized_model:
+                os.remove(optimized_model_path)
+        else:
+            network = network_from_onnx_path(onnx_model_path)
+
+        # Set optimization profiles for dynamic shapes
+        profile = self._set_optimization_profiles()
+
+        # Set calibrator for Int8 quantization
+        if self.int8 and self.calibration_data_generator_ is None:
+            self.calibration_data_generator_ = Calibrator(data_loader=self._random_data_generator(),
+                                                          cache=self.calibration_cache_)
+
+        config = CreateConfig(
+            profiles=profile,
+            calibrator=self.calibration_data_generator_,
+            **self._get_tensorrt_config()
+        )
         engine = engine_from_network(network, config=config)
         save_engine(engine, output_engine)
+
+    def _set_inputs(self, onnx_model):
+        for input_ in onnx_model.graph.input:
+            name, raw_dtype = input_.name, input_.type.tensor_type
+
+            dtype = _TENSORPROTO_DATATYPE.values_by_number[raw_dtype.elem_type].name.lower()
+
+            if raw_dtype.HasField("shape"):
+                shape_list = []
+                for i, d in enumerate(raw_dtype.shape.dim):
+                    if d.HasField("dim_value"):
+                        shape_list.append(d.dim_value)
+                    elif d.HasField("dim_param"):
+                        if i > 0:
+                            raise TypeError(f'Only the batch dimension can be dynamic, '
+                                            f'while the {i}-th dimension of {name} is dynamic')
+                        shape_list.append(-1)
+                    else:
+                        raise TypeError(f"The {i}-th dimension of input '{name} is invalid")
+                self.inputs_[name] = shape_list, dtype, shape_list[0] == -1
+            else:
+                raise ValueError(f"The input '{name}' of ONNX does not have a shape field")
 
     def _get_tensorrt_config(self):
         return {k: v for k, v in self.__dict__.items() if not k.endswith('_')}
 
-    def _set_optimization_profiles(self, network):
+    def _set_optimization_profiles(self):
         profile = Profile()
-        for i in range(network.num_inputs):
-            input_ = network.get_input(i)
-            name, shape, dtype = input_.name, input_.shape, input_.dtype.name.lower()
-            shape = network.get_input(i).shape
-
-            shape_list = []
-            found_dynamic = False
-            for dim_i, dim in enumerate(shape):
-                if dim < 0:
-                    if dim_i > 0:
-                        raise NotImplementedError(f'Only the batch dimension can be dynamic, '
-                                                  f'while the {dim_i}-th dimension of {name} is dynamic')
-                    found_dynamic = True
-
-                shape_list.append(dim)
-
-            if found_dynamic:
+        for name, (shape_list, _, is_dynamic_batch_size) in self.inputs_.items():
+            if is_dynamic_batch_size:
                 profile.add(
                     name,
                     min=tuple([self.min_batch_size_] + shape_list[1:]),
                     max=tuple([self.max_batch_size_] + shape_list[1:]),
                     opt=tuple([self.opt_batch_size_] + shape_list[1:])
                 )
-                self.inputs_[name] = [self.opt_batch_size_] + shape_list[1:], dtype
-            else:
-                self.inputs_[name] = shape_list, dtype
 
         return [profile] if len(profile) > 0 else None
 
     def _random_data_generator(self):
         for _ in range(4):
             data = {}
-            for name, (shape, dtype) in self.inputs_.items():
+            for name, (shape, dtype, is_dynamic_batch_size) in self.inputs_.items():
+                if is_dynamic_batch_size:
+                    shape = [self.opt_batch_size_] + shape[1:]
+
                 if 'float' in dtype:
                     data[name] = np.random.random(size=shape).astype('float32')
                 elif 'int' in dtype:
@@ -202,6 +256,28 @@ class TRTConverter:
                     raise ValueError('Only float or int inputs are supported for calibration using random data')
 
             yield data
+
+    def _get_fixed_input_shapes(self):
+        shapes = {}
+        for name, (shape_list, _, is_dynamic_batch_size) in self.inputs_.items():
+            if is_dynamic_batch_size:
+                shapes[name] = [1] + shape_list[1:]
+            else:
+                shapes[name] = shape_list
+
+        return shapes
+
+    @staticmethod
+    def _run_onnx_optimizer(onnx_model):
+        model = onnxoptimizer.optimize(onnx_model)
+        check_model(model)
+        return model
+
+    @staticmethod
+    def _run_onnx_simplifier(onnx_model, **kwargs):
+        model, success = onnxsim.simplify(onnx_model, **kwargs)
+        assert success, "Simplified ONNX model could not be validated"
+        return model
 
 
 def main():
