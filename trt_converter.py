@@ -51,7 +51,7 @@ class TRTConverter:
             use_dla=None,
             allow_gpu_fallback=None,
             use_onnx_optimizer=True,
-            use_onnx_simplifier=True,
+            use_onnx_simplifier=False,
             min_batch_size=1,
             max_batch_size=1,
             opt_batch_size=1,
@@ -216,7 +216,7 @@ class TRTConverter:
                 OnnxrtRunner(build_onnxrt_session),
                 TrtRunner(engine),
             ]
-            run_results = Comparator.run(runners, data_loader=self._random_data_generator())
+            run_results = Comparator.run(runners, data_loader=self._random_data_generator(1))
             for i in range(network[1].num_outputs):
                 name = network[1].get_output(i).name
                 result_arrays = [list(run_results.values())[i][0].dct[name].arr for i in range(len(list(runners)))]
@@ -263,8 +263,8 @@ class TRTConverter:
 
         return [profile] if len(profile) > 0 else None
 
-    def _random_data_generator(self):
-        for _ in range(4):
+    def _random_data_generator(self, num_iterations=4):
+        for _ in range(num_iterations):
             data = {}
             for name, (shape, dtype, is_dynamic_batch_size) in self.inputs_.items():
                 if is_dynamic_batch_size:
