@@ -8,7 +8,9 @@ import onnxsim
 from onnx.checker import check_model
 from onnx.onnx_ml_pb2 import _TENSORPROTO_DATATYPE
 from polygraphy import util
+from polygraphy.backend.onnxrt import OnnxrtRunner, SessionFromOnnx
 from polygraphy.backend.trt import (
+    TrtRunner,
     CreateConfig,
     Calibrator,
     Profile,
@@ -16,11 +18,12 @@ from polygraphy.backend.trt import (
     engine_from_network,
     network_from_onnx_path,
 )
+from polygraphy.comparator import Comparator
 from polygraphy.logger import G_LOGGER
 
 G_LOGGER.severity = G_LOGGER.INFO
 
-MODEL_NAME = 'tcn-with-two-inputs'
+MODEL_NAME = 'tcn'
 BATCH_SIZE = 4500
 INT8 = True
 INT8_STRING = INT8 * '-int8'
@@ -148,7 +151,7 @@ class TRTConverter:
         self.inputs_: Dict[str, Tuple[List[int], str, bool]] = {}
 
     def run(self, onnx_model_path, output_engine='out.trt', optimized_model_path='optimized.onnx',
-            remove_optimized_model=False):
+            remove_optimized_model=False, check_accuracy=True):
         """
         Convert an ONNX model to a TensorRT engine.
 
@@ -161,6 +164,8 @@ class TRTConverter:
                     The name of temporary optimized model
             remove_optimized_model (bool):
                     Whether to remove the temporary optimized model
+            check_accuracy (bool):
+                    Whether to compare between the accuracy of the converted model and the original model
         """
         model = onnx.load(onnx_model_path)
         self._set_inputs(model)
@@ -202,6 +207,16 @@ class TRTConverter:
         )
         engine = engine_from_network(network, config=config)
         save_engine(engine, output_engine)
+
+        # Compare accuracy
+        if check_accuracy:
+            build_onnxrt_session = SessionFromOnnx(onnx_model_path)
+            runners = [
+                OnnxrtRunner(build_onnxrt_session),
+                TrtRunner(engine),
+            ]
+            run_results = Comparator.run(runners, data_loader=self._random_data_generator())
+            Comparator.compare_accuracy(run_results)
 
     def _set_inputs(self, onnx_model):
         for input_ in onnx_model.graph.input:
