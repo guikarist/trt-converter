@@ -151,7 +151,7 @@ class TRTConverter:
         self.inputs_: Dict[str, Tuple[List[int], str, bool]] = {}
 
     def run(self, onnx_model_path, output_engine='out.trt', optimized_model_path='optimized.onnx',
-            remove_optimized_model=False, check_accuracy=True):
+            remove_optimized_model=True, check_accuracy=True):
         """
         Convert an ONNX model to a TensorRT engine.
 
