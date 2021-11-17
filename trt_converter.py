@@ -20,6 +20,7 @@ from polygraphy.backend.trt import (
 )
 from polygraphy.comparator import Comparator
 from polygraphy.logger import G_LOGGER
+from scipy.stats import pearsonr
 
 G_LOGGER.severity = G_LOGGER.INFO
 
@@ -216,6 +217,12 @@ class TRTConverter:
                 TrtRunner(engine),
             ]
             run_results = Comparator.run(runners, data_loader=self._random_data_generator())
+            for i in range(network[1].num_outputs):
+                name = network[1].get_output(i).name
+                result_arrays = [list(run_results.values())[i][0].dct[name].arr for i in range(len(list(runners)))]
+                print('-' * 10 +
+                      f"Pearson correlation coefficient for output '{name}': "
+                      f'{pearsonr(np.squeeze(result_arrays)[0], np.squeeze(result_arrays)[1])}' + '-' * 10)
             Comparator.compare_accuracy(run_results)
 
     def _set_inputs(self, onnx_model):
@@ -232,10 +239,10 @@ class TRTConverter:
                     elif d.HasField("dim_param"):
                         if i > 0:
                             raise TypeError(f'Only the batch dimension can be dynamic, '
-                                            f'while the {i}-th dimension of {name} is dynamic')
+                                            f"while the {i}-th dimension of '{name}' is dynamic")
                         shape_list.append(-1)
                     else:
-                        raise TypeError(f"The {i}-th dimension of input '{name} is invalid")
+                        raise TypeError(f"The {i}-th dimension of input '{name}' is invalid")
                 self.inputs_[name] = shape_list, dtype, shape_list[0] == -1
             else:
                 raise ValueError(f"The input '{name}' of ONNX does not have a shape field")
