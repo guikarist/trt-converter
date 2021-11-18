@@ -183,7 +183,7 @@ class TRTConverter:
             if check_accuracy:
                 with open(output_engine, 'rb') as f:
                     engine = engine_from_bytes(f.read())
-                    self.check_accuracy(engine, onnx_model_path)
+                    self._check_accuracy(engine, onnx_model_path)
             return
 
         # Optimize ONNX model
@@ -224,9 +224,9 @@ class TRTConverter:
 
         # Compare accuracy
         if check_accuracy:
-            self.check_accuracy(engine, onnx_model_path)
+            self._check_accuracy(engine, onnx_model_path)
 
-    def check_accuracy(self, engine, onnx_model_path):
+    def _check_accuracy(self, engine, onnx_model_path):
         build_onnxrt_session = SessionFromOnnx(onnx_model_path)
         runners = [
             OnnxrtRunner(build_onnxrt_session),
