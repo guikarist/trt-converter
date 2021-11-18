@@ -219,7 +219,7 @@ class TRTConverter:
             calibrator=self.calibration_data_generator_,
             **self._get_tensorrt_config()
         )
-        engine = engine_from_network(network, config=config)
+        engine = engine_from_network(network, config=config, save_timing_cache=self.load_timing_cache)
         save_engine(engine, output_engine)
 
         # Compare accuracy
