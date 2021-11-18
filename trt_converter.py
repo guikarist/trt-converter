@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -16,6 +17,7 @@ from polygraphy.backend.trt import (
     Profile,
     save_engine,
     engine_from_network,
+    engine_from_bytes,
     network_from_onnx_path,
 )
 from polygraphy.comparator import Comparator
@@ -150,11 +152,12 @@ class TRTConverter:
 
         # {'input_name': ([dim0, dim1, ...], 'dtype', is_dynamic_batch_size)}
         self.inputs_: Dict[str, Tuple[List[int], str, bool]] = {}
+        self.outputs_: List[str] = []
 
     def run(self, onnx_model_path, output_engine='out.trt', optimized_model_path='optimized.onnx',
-            remove_optimized_model=True, check_accuracy=True):
+            remove_optimized_model=True, check_accuracy=True, override=True):
         """
-        Convert an ONNX model to a TensorRT engine.
+        Convert an ONNX model to a TensorRT engine and check output accuracy of the converted model.
 
         Args:
             onnx_model_path (Union[str, file-like]):
@@ -167,14 +170,24 @@ class TRTConverter:
                     Whether to remove the temporary optimized model
             check_accuracy (bool):
                     Whether to compare between the accuracy of the converted model and the original model
+            override (bool):
+                    Whether to override the converted model if it already exists
         """
         model = onnx.load(onnx_model_path)
-        self._set_inputs(model)
+        check_model(model)
+        self._set_inputs_and_outputs(model)
+
+        if not override and Path(output_engine).exists():
+            G_LOGGER.warning(f"'{output_engine}' already exists, "
+                             f"skip building because 'override' is set to 'False'")
+            if check_accuracy:
+                with open(output_engine, 'rb') as f:
+                    engine = engine_from_bytes(f.read())
+                    self.check_accuracy(engine, onnx_model_path)
+            return
 
         # Optimize ONNX model
         if self.use_onnx_optimizer_ or self.use_onnx_simplifier_:
-            onnx.checker.check_model(model)
-
             if self.use_onnx_optimizer_:
                 model = self._run_onnx_optimizer(model)
             if self.use_onnx_simplifier_:
@@ -211,21 +224,23 @@ class TRTConverter:
 
         # Compare accuracy
         if check_accuracy:
-            build_onnxrt_session = SessionFromOnnx(onnx_model_path)
-            runners = [
-                OnnxrtRunner(build_onnxrt_session),
-                TrtRunner(engine),
-            ]
-            run_results = Comparator.run(runners, data_loader=self._random_data_generator(1))
-            for i in range(network[1].num_outputs):
-                name = network[1].get_output(i).name
-                result_arrays = [list(run_results.values())[i][0].dct[name].arr for i in range(len(list(runners)))]
-                print('-' * 10 +
-                      f"Pearson correlation coefficient for output '{name}': "
-                      f'{pearsonr(np.squeeze(result_arrays)[0], np.squeeze(result_arrays)[1])}' + '-' * 10)
-            Comparator.compare_accuracy(run_results)
+            self.check_accuracy(engine, onnx_model_path)
 
-    def _set_inputs(self, onnx_model):
+    def check_accuracy(self, engine, onnx_model_path):
+        build_onnxrt_session = SessionFromOnnx(onnx_model_path)
+        runners = [
+            OnnxrtRunner(build_onnxrt_session),
+            TrtRunner(engine)
+        ]
+
+        run_results = Comparator.run(runners, data_loader=self._random_data_generator(1))
+        for output_name in self.outputs_:
+            result_arrays = [list(run_results.values())[i][0].dct[output_name].arr for i in range(len(list(runners)))]
+            G_LOGGER.info('-' * 10 + f"Pearson correlation coefficient for output '{output_name}': "
+                                     f'{pearsonr(result_arrays[0].ravel(), result_arrays[1].ravel())}' + '-' * 10)
+        Comparator.compare_accuracy(run_results)
+
+    def _set_inputs_and_outputs(self, onnx_model):
         for input_ in onnx_model.graph.input:
             name, raw_dtype = input_.name, input_.type.tensor_type
 
@@ -246,6 +261,9 @@ class TRTConverter:
                 self.inputs_[name] = shape_list, dtype, shape_list[0] == -1
             else:
                 raise ValueError(f"The input '{name}' of ONNX does not have a shape field")
+
+        for output in onnx_model.graph.output:
+            self.outputs_.append(output.name)
 
     def _get_tensorrt_config(self):
         return {k: v for k, v in self.__dict__.items() if not k.endswith('_')}
@@ -311,7 +329,7 @@ def main():
         int8=INT8,
         calibration_cache=OUTPUT_CACHE_PATH
     )
-    trt_converter.run(INPUT_ONNX_MODEL_PATH, OUTPUT_TENSORRT_MODEL_PATH)
+    trt_converter.run(INPUT_ONNX_MODEL_PATH, OUTPUT_TENSORRT_MODEL_PATH, override=False)
 
 
 if __name__ == "__main__":
